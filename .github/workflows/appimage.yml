@@ -1,0 +1,26 @@
+name: AppImage
+
+# Builds the AppImage on GitHub, so you do not need podman/docker locally.
+# Start it under "Actions -> AppImage -> Run workflow", or just push a commit.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest   # quick-sharun has to build on Arch Linux
+    steps:
+      - name: Install git (needed by actions/checkout)
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@v4
+
+      - name: Build AppImage
+        run: WORK="$GITHUB_WORKSPACE" sh build-appimage.sh --inside
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: niri-settings-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
