@@ -9,12 +9,31 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container: archlinux:latest   # quick-sharun has to build on Arch Linux
     steps:
       - name: Install git (needed by actions/checkout)
-        run: pacman -Syu --noconfirm --needed git
+        run: |
+          # pacman 7 sandboxes its downloads with Landlock, which some container hosts block
+          sed -i 's/^#[[:space:]]*DisableSandbox/DisableSandbox/' /etc/pacman.conf
+          pacman -Syu --noconfirm --needed git
 
       - uses: actions/checkout@v4
+
+      - name: Find the app file
+        # Works whatever the .py file is called and in whichever folder it is:
+        # it is the Python file that contains the app id, and it is copied to ./niri-settings.py.
+        run: |
+          echo "Files in the repository:"
+          find . -path ./.git -prune -o -type f -print | sort
+          f=$(grep -rl --include='*.py' --exclude-dir=.git 'dev\.niri\.Settings' . | sort | head -n 1 || true)
+          if [ -z "$f" ]; then
+            echo "::error::No Python file containing the app id 'dev.niri.Settings' was found in this repository. Upload the app's .py file."
+            exit 1
+          fi
+          echo "Using $f"
+          [ "$f" = "./niri-settings.py" ] || cp "$f" niri-settings.py
+          [ -f build-appimage.sh ] || { echo "::error::build-appimage.sh is missing from the repository root"; exit 1; }
 
       - name: Build AppImage
         run: WORK="$GITHUB_WORKSPACE" sh build-appimage.sh --inside
