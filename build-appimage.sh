@@ -10,7 +10,10 @@
 #
 # Options (environment variables):
 #   VERSION=1.2.3         version in the file name (default: today's date)
+#   FORMAT=squashfs|dwarfs  squashfs (default) = classic AppImage that tools like NixOS's appimage-run can open;
+#                         dwarfs = smaller/faster, but only the AppImage's own runtime can open it
 #   NO_TEST=1             skip the 12 second start test at the end
+#   APP_FILE=name.py      the app's file, if it is not called niri-settings.py (normally found automatically)
 #   CONTAINER_ENGINE=...  podman or docker (default: whichever is found)
 #   QS_URL=...            where to download quick-sharun from (pin a commit if you want reproducible builds)
 #
@@ -26,6 +29,19 @@ IMAGE=${IMAGE:-docker.io/library/archlinux:latest}
 QS_URL=${QS_URL:-https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/refs/heads/main/useful-tools/quick-sharun.sh}
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# Finds the app's Python file in a folder (also in sub-folders), whatever you named it:
+# APP_FILE=name.py wins, then niri-settings.py, then the first .py file that contains the app id.
+find_app() {
+    if [ -n "${APP_FILE:-}" ]; then
+        [ -f "$1/$APP_FILE" ] && echo "$1/$APP_FILE"
+    elif [ -f "$1/niri-settings.py" ]; then
+        echo "$1/niri-settings.py"
+    else
+        grep -rl --include='*.py' --exclude-dir='.git' 'dev\.niri\.Settings' "$1" 2>/dev/null | sort | head -n 1
+    fi
+    return 0
+}
 
 write_assets() {
     mkdir -p "$1"
@@ -52,7 +68,7 @@ EOF
 }
 
 host_main() {
-    [ -f "$HERE/niri-settings.py" ] || die "niri-settings.py must be in the same folder as this script"
+    [ -n "$(find_app "$HERE")" ] || die "the app's .py file must be in the same folder as this script (or set APP_FILE=name.py)"
     engine=${CONTAINER_ENGINE:-}
     if [ -z "$engine" ]; then
         engine=$(command -v podman || command -v docker || true)
@@ -62,7 +78,7 @@ host_main() {
     echo "Building in an Arch Linux container with $engine ..."
     exec "$engine" run --rm \
         -v "$HERE:/work:Z" -w /work \
-        -e VERSION="${VERSION:-}" -e NO_TEST="${NO_TEST:-0}" -e QS_URL="$QS_URL" \
+        -e VERSION="${VERSION:-}" -e NO_TEST="${NO_TEST:-0}" -e FORMAT="${FORMAT:-squashfs}" -e QS_URL="$QS_URL" -e APP_FILE="${APP_FILE:-}" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         "$IMAGE" sh /work/build-appimage.sh --inside
 }
@@ -70,17 +86,24 @@ host_main() {
 inside_main() {
     [ "$(id -u)" = 0 ] || die "--inside must run as root in the build container"
     WORK=${WORK:-/work}   # the folder with niri-settings.py (GitHub Actions sets it to the checkout)
-    [ -f "$WORK/niri-settings.py" ] || die "$WORK/niri-settings.py not found"
+    SRC=$(find_app "$WORK")
+    if [ -z "$SRC" ]; then
+        echo "Files in $WORK (the app's .py file has to be in this repo):" >&2
+        ls -A "$WORK" >&2
+        die "no app .py file found in $WORK. Name it niri-settings.py or set APP_FILE=yourfile.py"
+    fi
+    echo "Using $SRC"
 
+    sed -i 's/^#[[:space:]]*DisableSandbox/DisableSandbox/' /etc/pacman.conf   # pacman 7 + containers: no landlock
     pacman -Syu --noconfirm --needed \
         gcc patchelf binutils gawk grep findutils wget \
         python python-gobject python-cairo gtk4 libadwaita \
         adwaita-icon-theme hicolor-icon-theme shared-mime-info librsvg mesa \
-        xorg-server-xvfb xorg-xauth dbus ttf-dejavu
+        xorg-server-xvfb xorg-xauth dbus ttf-dejavu squashfs-tools desktop-file-utils
 
     # quick-sharun deploys what is installed in /usr, so the app has to be installed there first
-    install -Dm755 "$WORK/niri-settings.py" /usr/bin/niri-settings
-    python -m py_compile "$WORK/niri-settings.py"
+    install -Dm755 "$SRC" /usr/bin/niri-settings
+    python -m py_compile "$SRC"
     python -c "import gi, cairo; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1')
 from gi.repository import Gtk, Adw; print('GTK', Gtk.get_minor_version(), 'libadwaita', Adw.get_minor_version())"
 
@@ -102,6 +125,7 @@ from gi.repository import Gtk, Adw; print('GTK', Gtk.get_minor_version(), 'libad
     export DEPLOY_PYTHON=1          # bundle the system Python (and, with GTK, the gobject-introspection typelibs)
     export DEPLOY_GTK=1
     export GTK_DIR=gtk-4.0
+    export APPDIR="$B/AppDir"
     export STRACE_BINARY=niri-settings   # only run our app (not the bare python binaries) to discover dlopen()ed libs
 
     # extra things quick-sharun cannot discover by itself: libraries that Python modules load,
@@ -114,7 +138,24 @@ from gi.repository import Gtk, Adw; print('GTK', Gtk.get_minor_version(), 'libad
     done
     # shellcheck disable=SC2086
     ./quick-sharun /usr/bin/niri-settings $EXTRA
-    ./quick-sharun --make-appimage
+    FORMAT=${FORMAT:-squashfs}
+    mkdir -p "$OUTPATH"
+    case "$FORMAT" in
+        dwarfs)
+            ./quick-sharun --make-appimage
+            ;;
+        squashfs)
+            # quick-sharun has built "$B/AppDir"; pack it with the classic appimagetool (SquashFS + type2 runtime)
+            [ -d "$B/AppDir" ] || die "quick-sharun did not produce $B/AppDir"
+            APPIMAGETOOL_URL=${APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage}
+            wget --retry-connrefused --tries=30 -qO appimagetool "$APPIMAGETOOL_URL"
+            chmod +x appimagetool
+            # extract-and-run: no FUSE is needed inside the container
+            APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool --no-appstream "$B/AppDir" \
+                "$OUTPATH/Niri_Settings-$VERSION-$ARCH.AppImage"
+            ;;
+        *) die "FORMAT must be squashfs or dwarfs" ;;
+    esac
 
     img=$(ls -1 "$OUTPATH"/*.AppImage 2>/dev/null | head -n 1 || true)
     [ -n "$img" ] || die "no AppImage was produced"
@@ -130,6 +171,7 @@ from gi.repository import Gtk, Adw; print('GTK', Gtk.get_minor_version(), 'libad
 
 case "${1:-}" in
     --inside)     inside_main ;;
+    --find-app)   find_app "${2:-.}" ;;
     --assets-dir) [ -n "${2:-}" ] || die "--assets-dir needs a folder"; write_assets "$2" ;;
     "")           host_main ;;
     *)            die "unknown option '$1' (see the top of this file)" ;;
