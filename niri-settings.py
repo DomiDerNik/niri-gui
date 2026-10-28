@@ -363,6 +363,28 @@ JOURNAL = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "niri
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 PREFS = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "niri-settings" / "prefs.json"
 MANAGED_NAME = "niri-settings.kdl"
+
+
+def get_pref(key, default=None):
+    try:
+        return json.loads(PREFS.read_text()).get(key, default)
+    except Exception:
+        return default
+
+
+def set_pref(key, value):
+    try:
+        data = json.loads(PREFS.read_text())
+    except Exception:
+        data = {}
+    data[key] = value
+    try:
+        PREFS.parent.mkdir(parents=True, exist_ok=True)
+        PREFS.write_text(json.dumps(data))
+    except OSError:
+        pass
+
+
 MANAGED_HEADER = ("// Managed by niri-settings. Settings in this file override earlier files.\n"
                   "// config.kdl must include this file LAST.\n")
 
@@ -422,19 +444,12 @@ class Store:
 
     @staticmethod
     def _load_pref():
-        try:
-            m = json.loads(PREFS.read_text()).get("mode")
-            return m if m in ("managed", "inplace") else "managed"
-        except Exception:
-            return "managed"
+        m = get_pref("mode")
+        return m if m in ("managed", "inplace") else "managed"
 
     def set_mode(self, mode):
         self.mode = mode
-        try:
-            PREFS.parent.mkdir(parents=True, exist_ok=True)
-            PREFS.write_text(json.dumps({"mode": mode}))
-        except OSError:
-            pass
+        set_pref("mode", mode)
 
     @property
     def managed_mode(self) -> bool:
@@ -446,6 +461,10 @@ class Store:
 
     def is_editable(self, doc) -> bool:
         return not self.managed_mode or doc is self.managed
+
+    def can_modify(self, doc) -> bool:
+        """Existing list entries (rules, binds, autostart) can be edited in the file they live in."""
+        return not doc.error and not os.path.realpath(doc.path).startswith("/nix/store/")
 
     # ---- loading ----
     def load(self):
@@ -785,7 +804,7 @@ class Store:
         if body_text is None:
             lines = [head]
         else:
-            lines = [head + " {"] + ["    " + l.strip() for l in body_text.strip("\n").splitlines() if l.strip()] + ["}"]
+            lines = [head + " {"] + ["    " + l.rstrip() for l in textwrap.dedent(body_text).strip("\n").splitlines() if l.strip()] + ["}"]
         writable = self._wdocs()
         same = [(d, n) for d, n in self.top_nodes(name) if any(d is w for w in writable)]
         if same:
@@ -831,6 +850,88 @@ class Store:
         if target not in seen:
             return "missing"
         return "ok" if seen[-1] == target else "not-last"
+
+    # ---- moving existing rules into our own file ----
+    RULE_KINDS = ("window-rule", "layer-rule")
+
+    def effective_nodes(self, *names):
+        """Top-level nodes in the order niri applies them: include lines expanded in place.
+        Files that config.kdl never includes have no effect, so they do not show up here."""
+        out, seen = [], set()
+
+        def walk(doc, depth=0):
+            real = os.path.realpath(doc.path)
+            if real in seen or depth > 8:
+                return
+            seen.add(real)
+            for n in doc.nodes:
+                if n.disabled:
+                    continue
+                if n.name == "include" and n.args:
+                    p = os.path.realpath(doc.path.parent / str(n.arg0))
+                    sub = next((d for d in self.docs if os.path.realpath(d.path) == p), None)
+                    if sub is not None:
+                        walk(sub, depth + 1)
+                elif n.name in names:
+                    out.append((doc, n))
+        main = self._main_doc()
+        if main:
+            walk(main)
+        return out
+
+    def migratable(self, kinds=None):
+        """Active rules in other files that we are allowed to rewrite, in niri's order."""
+        if not self.managed_mode:
+            return []
+        return [(d, n) for d, n in self.effective_nodes(*(kinds or self.RULE_KINDS))
+                if d is not self.managed and self.can_modify(d)]
+
+    def stuck_rules(self):
+        """Active rules in files we must not rewrite (Nix store, unparsable)."""
+        return [(d, n) for d, n in self.effective_nodes(*self.RULE_KINDS)
+                if d is not self.managed and not self.can_modify(d)]
+
+    @staticmethod
+    def _node_lines(doc, node):
+        """The node's exact text (comments inside it included), de-indented."""
+        t = doc.text
+        ls = t.rfind("\n", 0, node.start) + 1
+        ind = re.match(r"[ \t]*", t[ls:]).group(0)
+        raw = t[node.start:node.end].splitlines()
+        return [raw[0]] + [l[len(ind):] if l.startswith(ind) else l for l in raw[1:]]
+
+    def migrate_rules(self) -> int:
+        """Move every window/layer rule from the other files into ours, keeping their order.
+
+        A copy would not do: both copies would keep applying, and editing ours could not undo the original.
+        Only done when config.kdl really includes our file, otherwise the rules would stop applying."""
+        if not self.managed_mode or self.include_status() != "ok":
+            return 0
+        total = 0
+        for kind in self.RULE_KINDS:
+            items = self.migratable((kind,))
+            if not items:
+                continue
+            lines = []
+            for i, (d, n) in enumerate(items):
+                if i:
+                    lines.append("")
+                lines += self._node_lines(d, n)
+            first = next((n for n in self.managed.nodes if n.name == kind and not n.disabled), None)
+            if first is not None:  # earlier files come first, so before the rules you added yourself
+                t = self.managed.text
+                ls = t.rfind("\n", 0, first.start) + 1
+                e = (ls, ls, "\n".join(lines) + "\n\n")
+            else:
+                e = self._append_top(self.managed, lines)
+            self.edit(self.managed, [e], "rules", f"move {kind}s into {self.managed.path.name}")
+            for _ in range(len(items) + 5):
+                left = self.migratable((kind,))
+                if not left:
+                    break
+                self.delete_node(left[0][0], left[0][1], "rules", f"move {kind}s into {self.managed.path.name}")
+                total += 1
+        return total
 
     def ensure_managed_file(self):
         if not self.managed.existed and not self.managed.text:
@@ -1194,6 +1295,7 @@ NAV = [
     ("STARTUP", [("autostart", "Autostart", "system-run-symbolic"),
                  ("env", "Env Variables", "utilities-terminal-symbolic")]),
     ("ADVANCED", [("misc", "Miscellaneous", "emblem-system-symbolic")]),
+    ("SHELL", [("noctalia", "Noctalia", "weather-clear-night-symbolic")]),
     ("SETUP", [("import", "Import & Backup", "folder-download-symbolic")]),
 ]
 TITLES = {pid: t for _, items in NAV for pid, t, _ in items}
@@ -1214,23 +1316,82 @@ def tilde(p) -> str:
 # --------------------------------------------------------------------------- monitors
 
 
+NIRI_ERROR = None  # why the last niri_outputs() call found nothing (shown on the Monitors page)
+NIRI_BIN_PLACES = ("/run/current-system/sw/bin/niri", "/usr/bin/niri", "/usr/local/bin/niri",
+                   "~/.nix-profile/bin/niri", "/etc/profiles/per-user/{user}/bin/niri")
+
+
+def _ipc_outputs():
+    """Ask niri through its IPC socket. Needs no `niri` binary, so it also works inside sandboxes/AppImages."""
+    import socket
+    path = os.environ.get("NIRI_SOCKET")
+    if not path:
+        raise RuntimeError("NIRI_SOCKET is not set (is niri running, and was this app started inside the niri session?)")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sk:
+        sk.settimeout(3)
+        sk.connect(path)
+        sk.sendall(b'"Outputs"\n')
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sk.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    reply = json.loads(buf)
+    if isinstance(reply, dict) and "Err" in reply:
+        raise RuntimeError(f"niri answered: {reply['Err']}")
+    data = reply.get("Ok", {}).get("Outputs") if isinstance(reply, dict) else None
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected answer from the niri socket")
+    return data
+
+
+def _cli_outputs():
+    exe = shutil.which("niri")
+    if not exe:
+        user = os.environ.get("USER", "")
+        for cand in NIRI_BIN_PLACES:
+            cand = os.path.expanduser(cand.format(user=user))
+            if os.access(cand, os.X_OK):
+                exe = cand
+                break
+    if not exe:
+        raise RuntimeError("the `niri` command was not found")
+    r = subprocess.run([exe, "msg", "--json", "outputs"], capture_output=True, text=True, timeout=4)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:200] or "`niri msg outputs` failed")
+    data = json.loads(r.stdout)
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected output from `niri msg outputs`")
+    return data
+
+
 def niri_outputs() -> dict:
-    """Ask the running niri about connected outputs. Empty dict if niri isn't running."""
+    """Connected outputs as reported by the running niri. Empty dict if niri cannot be asked (see NIRI_ERROR)."""
+    global NIRI_ERROR
+    NIRI_ERROR = None
     try:
-        out = subprocess.run(["niri", "msg", "--json", "outputs"], capture_output=True, text=True, timeout=3).stdout
-        data = json.loads(out)
-    except Exception:
-        return {}
+        data = _ipc_outputs()
+    except Exception as e1:  # noqa: BLE001
+        try:
+            data = _cli_outputs()
+        except Exception as e2:  # noqa: BLE001
+            NIRI_ERROR = f"{e1}; {e2}"
+            return {}
     res = {}
     for name, o in data.items():
-        modes = [(m["width"], m["height"], m["refresh_rate"]) for m in o.get("modes", [])]
-        cur = o.get("current_mode")
-        lg = o.get("logical") or {}
-        tr = re.sub(r"(?i)flipped(\d+)", r"flipped-\1", str(lg.get("transform", "Normal"))).lower()
-        res[name] = dict(make=o.get("make", ""), model=o.get("model", ""), modes=modes,
-                         cur_idx=cur if cur is not None and cur < len(modes) else None,
-                         vrr=bool(o.get("vrr_supported")), x=lg.get("x", 0), y=lg.get("y", 0),
-                         scale=lg.get("scale", 1.0), transform=tr, lw=lg.get("width"), lh=lg.get("height"))
+        try:
+            modes = [(m["width"], m["height"], m["refresh_rate"]) for m in o.get("modes", [])]
+            cur = o.get("current_mode")
+            lg = o.get("logical") or {}
+            tr = re.sub(r"(?i)flipped(\d+)", r"flipped-\1", str(lg.get("transform", "Normal"))).lower()
+            res[name] = dict(make=o.get("make", ""), model=o.get("model", ""), modes=modes,
+                             cur_idx=cur if cur is not None and cur < len(modes) else None,
+                             vrr=bool(o.get("vrr_supported")), x=lg.get("x", 0), y=lg.get("y", 0),
+                             scale=lg.get("scale", 1.0), transform=tr, lw=lg.get("width"), lh=lg.get("height"))
+        except Exception:  # noqa: BLE001  (one odd output must not hide the others)
+            res[name] = dict(make="", model="", modes=[], cur_idx=None, vrr=False, x=0, y=0, scale=1.0,
+                             transform="normal", lw=None, lh=None)
     return res
 
 
@@ -1392,7 +1553,7 @@ class Window(Adw.ApplicationWindow):
             "layout": self.pg_layout, "animations": self.pg_animations, "cursor": self.pg_cursor,
             "keybinds": self.pg_keybinds, "keyboard": self.pg_keyboard, "pointer": self.pg_pointer,
             "monitors": self.pg_monitors, "rules": self.pg_rules, "autostart": self.pg_autostart,
-            "env": self.pg_env, "misc": self.pg_misc, "import": self.pg_import,
+            "env": self.pg_env, "misc": self.pg_misc, "import": self.pg_import, "noctalia": self.pg_noctalia,
         }
         self.build_shell()
         self.connect("close-request", self.on_close)
@@ -1701,6 +1862,8 @@ class Window(Adw.ApplicationWindow):
         bad = [x for x in self.store.docs if x.error]
         if bad:
             self.toast(f"Could not parse {bad[0].path.name}: {bad[0].error[:80]}")
+        if not j and self.store.managed_mode and get_pref("migrate_prompt") != "never":
+            self.ask_migrate(startup=True)
         return False
 
     # ---- dialogs -----------------------------------------------------------------
@@ -1968,6 +2131,20 @@ class Window(Adw.ApplicationWindow):
         items = self.store.children_of(path)
         return items[i] if i < len(items) else None
 
+    def _foreign_tip(self, doc, *buttons):
+        """buttons = (button, label) pairs; mention the file that will really be changed."""
+        if self.store.managed_mode and doc is not self.store.managed and self.store.can_modify(doc):
+            for b, label in buttons:
+                b.set_tooltip_text(f"{label} (changes {doc.path.name} directly)")
+
+    def _note_foreign(self, doc, once=False):
+        if self.store.managed_mode and doc is not self.store.managed:
+            seen = self.__dict__.setdefault("_foreign_noted", set())
+            if once and doc.path in seen:
+                return
+            seen.add(doc.path)
+            self.toast(f"Changed {doc.path.name} directly, because that entry lives there.")
+
     def pg_keybinds(self):
         pg = self.page()
         search = Gtk.SearchEntry(placeholder_text="Filter keybinds…")
@@ -1979,15 +2156,16 @@ class Window(Adw.ApplicationWindow):
         rows = []
         for i, (doc, node) in enumerate(self.store.children_of(["binds"])):
             action = " ".join(l.strip() for l in self.store.body_text(doc, node).splitlines())
-            ro = not self.store.is_editable(doc)
-            row = Adw.ActionRow(title=esc(node.name), subtitle=esc(action + (f"   —   {doc.path.name}" if ro else "")))
+            ro = not self.store.can_modify(doc)
+            foreign = self.store.managed_mode and doc is not self.store.managed
+            row = Adw.ActionRow(title=esc(node.name), subtitle=esc(action + (f"   —   {doc.path.name}" if foreign else "")))
             row.set_subtitle_lines(1)
             b1 = self.icon_btn("document-edit-symbolic", "Edit", lambda i=i: self.edit_bind(i))
             b2 = self.icon_btn("user-trash-symbolic", "Delete", lambda i=i: self.del_bind(i))
             for b in ((b1, b2) if ro else ()):
                 b.set_sensitive(False)
-                b.set_tooltip_text(f"Defined in {doc.path.name}: read-only in separate-file mode. "
-                                   "Add the same key here to override it.")
+                b.set_tooltip_text(f"Defined in {doc.path.name}, which cannot be modified (read-only or unparsable).")
+            self._foreign_tip(doc, (b1, "Edit"), (b2, "Delete"))
             row.add_suffix(b1)
             row.add_suffix(b2)
             g.add(row)
@@ -2005,7 +2183,7 @@ class Window(Adw.ApplicationWindow):
         if not loc:
             return
         doc, node = loc
-        if not self.store.is_editable(doc):
+        if not self.store.can_modify(doc):
             return
         action = "; ".join(l.strip().rstrip(";") for l in self.store.body_text(doc, node).splitlines() if l.strip())
 
@@ -2015,29 +2193,48 @@ class Window(Adw.ApplicationWindow):
             cur = self.nth(["binds"], i)
             if cur:
                 self.store.rewrite_bind(cur[0], cur[1], v[0], v[1], "keybinds", f"edit {v[0]}")
+                self._note_foreign(cur[0])
                 self.rebuild_page("keybinds")
         self.form("Edit keybind", [("Key combination", node.name), ("Action", action)], "Apply", ok)
 
     def del_bind(self, i):
         loc = self.nth(["binds"], i)
-        if loc and self.store.is_editable(loc[0]):
+        if loc and self.store.can_modify(loc[0]):
             self.store.delete_node(loc[0], loc[1], "keybinds", f"remove {loc[1].name}")
+            self._note_foreign(loc[0])
             self.rebuild_page("keybinds")
 
     # ---- pages: monitors ------------------------------------------------------------------------------
     def pg_monitors(self):
         pg, st = self.page(), self.store
         mons = niri_outputs()
+        reachable = NIRI_ERROR is None
+        stale = []
         for d, n in st.find_all(["output"]):
             name = n.arg0
             if name and name not in mons:
+                if reachable:  # niri answered and this output is not connected: do not pretend it is
+                    if name not in stale:
+                        stale.append(name)
+                    continue
                 mons[name] = dict(make="", model="", modes=[], cur_idx=None, vrr=False, x=0, y=0,
                                   scale=1.0, transform="normal", lw=None, lh=None)
+        if not reachable:
+            wg = self.group(pg)
+            wg.add(Adw.ActionRow(
+                title="Could not ask niri which monitors are connected",
+                subtitle=esc(f"{NIRI_ERROR}. Showing only the outputs written in your config, which may not be "
+                             "the monitors you have right now."), css_classes=["error"]))
         if not mons:
             g = self.group(pg)
             g.add(Adw.StatusPage(title="No monitors found", icon_name="video-display-symbolic",
                                  description="Start niri to detect outputs, or add an  output \"NAME\" { }  block."))
             return pg
+        if reachable and stale:
+            sg = self.group(pg, "Configured but not connected",
+                            "These outputs are in your config, but niri does not see them right now.")
+            for nm in stale:
+                sg.add(Adw.ActionRow(title=esc(nm), subtitle="not connected", css_classes=["dim-label"]))
         names = sorted(mons, key=lambda n: (mons[n]["x"], n))
         mons = {n: mons[n] for n in names}
         g = self.group(pg, desc="Drag monitors to reposition them. Edges snap together.")
@@ -2125,8 +2322,58 @@ class Window(Adw.ApplicationWindow):
             others.append(c.name + (" " + " ".join(str(a.value) for a in c.args) if c.args else ""))
         return " | ".join(parts) or "All windows", " · ".join(others) or "no properties"
 
+    def _migration_counts(self):
+        mv = self.store.migratable()
+        return len(mv), len(self.store.stuck_rules()), sorted({d.path.name for d, n in mv})
+
+    def _migration_group(self, pg):
+        n, stuck, files = self._migration_counts()
+        if not n:
+            return
+        ok = self.store.include_status() == "ok"
+        name = self.store.managed.path.name
+        sub = (f"{n} rule(s) live in {', '.join(files)}. Move them into {name} to edit everything in one place. "
+               "They are removed from the original files; Discard undoes it." if ok else
+               "Add the include line first (banner at the top), otherwise the moved rules would stop applying.")
+        row = Adw.ActionRow(title=esc(f"Move existing rules into {name}"), subtitle=esc(sub))
+        row.set_subtitle_lines(4)
+        b = Gtk.Button(label="Move them", valign=Gtk.Align.CENTER, css_classes=["suggested-action"], sensitive=ok)
+        b.connect("clicked", lambda *_: self.ask_migrate())
+        row.add_suffix(b)
+        self.group(pg).add(row)
+
+    def ask_migrate(self, startup=False):
+        n, stuck, files = self._migration_counts()
+        if not n or self.store.include_status() != "ok":
+            return False
+        name = self.store.managed.path.name
+        body = (f"Move {n} window/layer rule(s) from {', '.join(files)} into {name}?\n\n"
+                "They are removed from the original files and keep their order, so behaviour does not change. "
+                "Review the result, then Save now, or use Discard to undo it.")
+        if stuck:
+            body += f"\n\n{stuck} rule(s) in read-only files stay where they are and will apply before the moved ones."
+        answers = [("later", "Not now", None)] + ([("never", "Don't ask again", None)] if startup else []) + \
+                  [("move", "Move rules", Adw.ResponseAppearance.SUGGESTED)]
+        d, show = self.dialog("Move existing rules?", body, answers)
+
+        def on(dlg, r):
+            if r == "never":
+                set_pref("migrate_prompt", "never")
+            elif r == "move":
+                self.do_migrate()
+        d.connect("response", on)
+        show()
+        return True
+
+    def do_migrate(self):
+        moved = self.store.migrate_rules()
+        self.rebuild_page("rules")
+        self.refresh_state()
+        self.toast(f"Moved {moved} rule(s). Review them, then press Save now." if moved else "Nothing to move")
+
     def pg_rules(self):
         pg = self.page()
+        self._migration_group(pg)
         for kind, title, tmpl in (("window-rule", "Window rules", 'match app-id="^firefox$"\nopen-floating true'),
                                   ("layer-rule", "Layer rules", 'match namespace="^notifications$"\nblock-out-from "screencast"')):
             g = self.group(pg, title)
@@ -2138,14 +2385,16 @@ class Window(Adw.ApplicationWindow):
                                       self.rebuild_page("rules"))))
             for i, (doc, node) in enumerate(self.store.top_nodes(kind)):
                 t, sub = self.rule_summary(node)
-                ro = not self.store.is_editable(doc)
-                row = Adw.ActionRow(title=esc(t), subtitle=esc(sub + (f"   —   {doc.path.name}" if ro else "")))
+                ro = not self.store.can_modify(doc)
+                foreign = self.store.managed_mode and doc is not self.store.managed
+                row = Adw.ActionRow(title=esc(t), subtitle=esc(sub + (f"   —   {doc.path.name}" if foreign else "")))
                 row.set_subtitle_lines(2)
                 b1 = self.icon_btn("document-edit-symbolic", "Edit", lambda i=i, kind=kind: self.edit_rule(kind, i))
                 b2 = self.icon_btn("user-trash-symbolic", "Delete", lambda i=i, kind=kind: self.del_rule(kind, i))
                 for b in ((b1, b2) if ro else ()):
                     b.set_sensitive(False)
-                    b.set_tooltip_text(f"Defined in {doc.path.name}: read-only in separate-file mode")
+                    b.set_tooltip_text(f"Defined in {doc.path.name}, which cannot be modified (read-only or unparsable).")
+                self._foreign_tip(doc, (b1, "Edit"), (b2, "Delete"))
                 row.add_suffix(b1)
                 row.add_suffix(b2)
                 g.add(row)
@@ -2158,20 +2407,22 @@ class Window(Adw.ApplicationWindow):
         if i >= len(items):
             return
         doc, node = items[i]
-        if not self.store.is_editable(doc):
+        if not self.store.can_modify(doc):
             return
 
         def ok(text):
             cur = self.store.top_nodes(kind)
             if i < len(cur):
                 self.store.set_body(cur[i][0], cur[i][1], text, "rules", f"edit {kind}")
+                self._note_foreign(cur[i][0])
                 self.rebuild_page("rules")
         self.text_dialog(f"Edit {kind}", "Raw KDL, one entry per line.", self.store.body_text(doc, node), ok)
 
     def del_rule(self, kind, i):
         items = self.store.top_nodes(kind)
-        if i < len(items) and self.store.is_editable(items[i][0]):
+        if i < len(items) and self.store.can_modify(items[i][0]):
             self.store.delete_node(items[i][0], items[i][1], "rules", f"remove {kind}")
+            self._note_foreign(items[i][0])
             self.rebuild_page("rules")
 
     def pg_autostart(self):
@@ -2186,11 +2437,12 @@ class Window(Adw.ApplicationWindow):
             row.set_show_apply_button(True)
             row.connect("apply", lambda r, i=i, sh=sh: self.apply_autostart(i, r.get_text(), sh))
             rm = self.icon_btn("user-trash-symbolic", "Remove", lambda i=i: self.del_autostart(i))
-            if not self.store.is_editable(doc):
+            if not self.store.can_modify(doc):
                 row.set_editable(False)
                 row.set_show_apply_button(False)
                 rm.set_sensitive(False)
-                rm.set_tooltip_text(f"Defined in {doc.path.name}: read-only in separate-file mode")
+                rm.set_tooltip_text(f"Defined in {doc.path.name}, which cannot be modified (read-only or unparsable).")
+            self._foreign_tip(doc, (rm, "Remove"))
             row.add_suffix(rm)
             g.add(row)
         if not items:
@@ -2213,18 +2465,20 @@ class Window(Adw.ApplicationWindow):
 
     def apply_autostart(self, i, text, sh):
         items = self.store.top_nodes("spawn-at-startup", "spawn-sh-at-startup")
-        if i >= len(items) or not text.strip() or not self.store.is_editable(items[i][0]):
+        if i >= len(items) or not text.strip() or not self.store.can_modify(items[i][0]):
             return
         try:
             parts = [text.strip()] if sh else shlex.split(text)
         except ValueError:
             return self.toast("Unbalanced quotes in command")
         self.store.replace_args(items[i][0], items[i][1], parts, "autostart", f"edit {parts[0]}")
+        self._note_foreign(items[i][0])
 
     def del_autostart(self, i):
         items = self.store.top_nodes("spawn-at-startup", "spawn-sh-at-startup")
-        if i < len(items) and self.store.is_editable(items[i][0]):
+        if i < len(items) and self.store.can_modify(items[i][0]):
             self.store.delete_node(items[i][0], items[i][1], "autostart", "remove autostart entry")
+            self._note_foreign(items[i][0])
             self.rebuild_page("autostart")
 
     def pg_env(self):
@@ -2271,6 +2525,421 @@ class Window(Adw.ApplicationWindow):
         g.add(self.r_switch("misc", "Disable primary clipboard", "Middle-click paste", ["clipboard", "disable-primary"]))
         g.add(self.r_switch("misc", "Hide config-error notification", "", ["config-notification", "disable-failed"]))
         return pg
+
+    # ---- page: Noctalia shell ------------------------------------------------------------------
+    # (key, label, v5 `noctalia msg ...`, v4 `ipc call ...` or None)
+    NOCTALIA_BINDS = [
+        ("Mod+Space", "Launcher", "panel-toggle launcher", "launcher toggle"),
+        ("Mod+S", "Control center", "panel-toggle control-center", "controlCenter toggle"),
+        ("Mod+Comma", "Noctalia settings", "settings-toggle", "settings toggle"),
+        ("Alt+Tab", "Window switcher", "window-switcher hold", None),
+        ("XF86AudioRaiseVolume", "Volume up", "volume-up", "volume increase"),
+        ("XF86AudioLowerVolume", "Volume down", "volume-down", "volume decrease"),
+        ("XF86AudioMute", "Mute", "volume-mute", "volume muteOutput"),
+        ("XF86MonBrightnessUp", "Brightness up", "brightness-up", "brightness increase"),
+        ("XF86MonBrightnessDown", "Brightness down", "brightness-down", "brightness decrease"),
+    ]
+    BLUR_NS = r'^noctalia-(bar-[^\"]+|notification|dock|panel|attached-panel|osd)$'
+
+    def nv(self):
+        v = get_pref("noctalia")
+        if v in ("v5", "v4"):
+            return v
+        if not shutil.which("noctalia") and (shutil.which("noctalia-shell") or shutil.which("qs")):
+            return "v4"
+        return "v5"
+
+    def n_start_cmd(self):
+        if self.nv() == "v5":
+            return ["noctalia"]
+        return ["noctalia-shell"] if shutil.which("noctalia-shell") else ["qs", "-c", "noctalia-shell"]
+
+    def n_settings_cmd(self):
+        if self.nv() == "v5":
+            return ["noctalia", "msg", "settings-toggle"]
+        return ["qs", "-c", "noctalia-shell", "ipc", "call", "settings", "toggle"]
+
+    def n_running(self):
+        pat = ["pgrep", "-x", "noctalia"] if self.nv() == "v5" else ["pgrep", "-f", "noctalia-shell"]
+        try:
+            return subprocess.run(pat, capture_output=True, timeout=2).returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def n_spawn(cmd):
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+    def n_restart(self):
+        try:
+            if self.nv() == "v5":
+                subprocess.run(["pkill", "-x", "noctalia"], timeout=3)
+            else:
+                subprocess.run(["pkill", "-f", "noctalia-shell"], timeout=3)
+        except Exception:  # noqa: BLE001
+            pass
+
+        def go():
+            try:
+                self.n_spawn(self.n_start_cmd())
+            except OSError as e:
+                self.toast(f"Could not start Noctalia: {e}")
+            GLib.timeout_add(1500, lambda: (self.rebuild_page("noctalia"), False)[1])
+            return False
+        GLib.timeout_add(700, go)
+
+    @staticmethod
+    def niri_version():
+        try:
+            out = subprocess.run(["niri", "--version"], capture_output=True, text=True, timeout=3).stdout
+        except Exception:  # noqa: BLE001
+            return None
+        m = re.search(r"(\d+)\.(\d+)", out)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
+    # -- rule helpers --
+    def _rules(self, kind, pred):
+        return [(d, n) for d, n in self.store.top_nodes(kind) if pred(n)]
+
+    @staticmethod
+    def _match_ns(n, test):
+        return any(test(str(m.prop("namespace", ""))) for m in n.kids("match"))
+
+    @staticmethod
+    def _bare(n):
+        return not n.kids("match")
+
+    def _delete_rules(self, kind, pred, desc):
+        while True:
+            items = [(d, n) for d, n in self._rules(kind, pred) if self.store.can_modify(d)]
+            if not items:
+                break
+            self.store.delete_node(items[0][0], items[0][1], "noctalia", desc)
+            self._note_foreign(items[0][0], once=True)
+        return [d.path.name for d, n in self._rules(kind, pred)]
+
+    def _blocked_toast(self, names):
+        if names:
+            self.toast(f"Still defined in {', '.join(sorted(set(names)))}, which this app cannot modify "
+                       "(read-only file or syntax error).")
+
+    def _rule_switch(self, title, sub, specs):
+        """Switch that adds/removes a group of rules. specs = [(kind, predicate, body_text)]."""
+        row = Adw.SwitchRow(title=title, subtitle=esc(sub))
+        row.set_active(any(self._rules(k, p) for k, p, _ in specs))
+
+        def cb(r, _):
+            if r.get_active():
+                for kind, pred, body in specs:
+                    if not self._rules(kind, pred):
+                        self.store.add_top_node(kind, body, page="noctalia", desc=title)
+            else:
+                blocked = []
+                for kind, pred, _ in specs:
+                    blocked += self._delete_rules(kind, pred, title)
+                self._blocked_toast(blocked)
+            r.add_css_class("changed")
+            self.rebuild_page("noctalia")
+        row.connect("notify::active", cb)
+        return row
+
+    # -- wallpaper / overview --
+    def wp_mode(self):
+        if self._rules("layer-rule", lambda n: self._match_ns(n, lambda s: s.startswith("^noctalia-backdrop"))):
+            return 1
+        if self._rules("layer-rule", lambda n: self._match_ns(n, lambda s: s.startswith("^noctalia-wallpaper"))):
+            return 2
+        if self.store.find(["overview", "backdrop-color"]) is not None:
+            return 3
+        return 0
+
+    def set_wp_mode(self, mode):
+        st, desc, blocked = self.store, "overview wallpaper", []
+        specs = {1: "^noctalia-backdrop", 2: "^noctalia-wallpaper"}
+        for m, ns in specs.items():
+            pred = lambda n, ns=ns: self._match_ns(n, lambda s: s.startswith(ns))  # noqa: E731
+            if m != mode:
+                blocked += self._delete_rules("layer-rule", pred, desc)
+            elif not self._rules("layer-rule", pred):
+                st.add_top_node("layer-rule", f'match namespace="{ns}"\nplace-within-backdrop true',
+                                page="noctalia", desc=desc)
+        if mode == 2:
+            st.set_value(["layout", "background-color"], "transparent", "noctalia", desc)
+            st.set_flag(["overview", "workspace-shadow", "off"], True, "noctalia", desc)
+        else:
+            if st.get(["layout", "background-color"]) == "transparent":
+                st.delete_path(["layout", "background-color"], "noctalia", desc)
+                if st.find(["layout", "background-color"]) is not None:
+                    blocked.append(st.shadow_file(["layout", "background-color"]) or "another file")
+            if st.find(["overview", "workspace-shadow", "off"]) is not None:
+                st.delete_path(["overview", "workspace-shadow", "off"], "noctalia", desc)
+                if st.find(["overview", "workspace-shadow", "off"]) is not None:
+                    blocked.append(st.shadow_file(["overview", "workspace-shadow", "off"]) or "another file")
+        if mode == 3:
+            st.set_value(["overview", "backdrop-color"], st.get(["overview", "backdrop-color"], "#26233a"),
+                         "noctalia", desc)
+        elif st.find(["overview", "backdrop-color"]) is not None:
+            st.delete_path(["overview", "backdrop-color"], "noctalia", desc)
+            if st.find(["overview", "backdrop-color"]) is not None:
+                blocked.append(st.shadow_file(["overview", "backdrop-color"]) or "another file")
+        self._blocked_toast(blocked)
+
+    # -- keybinds --
+    def n_binds(self):
+        v5, out = self.nv() == "v5", []
+        for key, label, m5, m4 in self.NOCTALIA_BINDS:
+            m = m5 if v5 else m4
+            if m is None:
+                continue
+            act = f'spawn-sh "noctalia msg {m}"' if v5 else f'spawn-sh "qs -c noctalia-shell ipc call {m}"'
+            out.append((key, label, act))
+        return out
+
+    def _bind_loc(self, key):
+        for d, c in self.store.children_of(["binds"]):
+            if c.name == key:
+                return d, c
+        return None
+
+    def _bind_text(self, loc):
+        return re.sub(r"\s+", " ", self.store.body_text(*loc).strip().rstrip(";").strip())
+
+    def set_bind(self, key, act):
+        loc = self._bind_loc(key)
+        if loc and self.store.is_editable(loc[0]):
+            self.store.rewrite_bind(loc[0], loc[1], key, act, "noctalia", f"bind {key}")
+        else:  # nothing there, or defined in a file we cannot edit: add / override in our own file
+            props = ""
+            if loc and loc[1].body_start is not None:  # keep e.g. allow-when-locked=true of the bind we override
+                props = loc[0].text[loc[1].name_end:loc[1].body_start].strip()
+            self.store.add_child_line(["binds"], f"{key}{' ' + props if props else ''} {{ {act}; }}",
+                                      "noctalia", f"bind {key}")
+
+    def remove_bind(self, key, act):
+        loc = self._bind_loc(key)
+        if not loc or self._bind_text(loc) != act:
+            return
+        if self.store.can_modify(loc[0]):
+            self.store.delete_node(loc[0], loc[1], "noctalia", f"remove bind {key}")
+            self._note_foreign(loc[0], once=True)
+        else:
+            self._blocked_toast([loc[0].path.name])
+
+    def pg_noctalia(self):
+        pg, st = self.page(), self.store
+        v5 = self.nv() == "v5"
+        exe = shutil.which("noctalia") if v5 else (shutil.which("noctalia-shell") or shutil.which("qs"))
+
+        # -- status / startup
+        g = self.group(pg, "Noctalia shell",
+                       "Sets up niri the way Noctalia's documentation recommends. Noctalia's own look and "
+                       "widgets are configured inside Noctalia (button below).")
+        vr = Adw.ComboRow(title="Noctalia version", subtitle="Decides the command and keybind syntax")
+        vr.set_model(Gtk.StringList.new(["v5+  (noctalia)", "v4 legacy  (Quickshell, noctalia-shell)"]))
+        vr.set_selected(0 if v5 else 1)
+
+        def ver_cb(r, _):
+            set_pref("noctalia", "v5" if r.get_selected() == 0 else "v4")
+            self.rebuild_page("noctalia")
+        vr.connect("notify::selected", ver_cb)
+        g.add(vr)
+
+        inst = Adw.ActionRow(title="Installed" if exe else "Not found",
+                             subtitle=esc(exe) if exe else "Install it first, then reopen this page.")
+        if not exe:
+            ib = Gtk.Button(label="Install guide", valign=Gtk.Align.CENTER)
+            ib.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
+                "https://docs.noctalia.dev/noctalia/getting-started/installation/", None))
+            inst.add_suffix(ib)
+        g.add(inst)
+
+        running = self.n_running()
+        prow = Adw.ActionRow(title="Shell process", subtitle="Running" if running else "Not running")
+        for label, fn in (("Restart" if running else "Start", self.n_restart),
+                          ("Settings", lambda: self.n_spawn(self.n_settings_cmd()))):
+            b = Gtk.Button(label=label, valign=Gtk.Align.CENTER, sensitive=bool(exe))
+            b.connect("clicked", lambda *_, fn=fn: fn())
+            prow.add_suffix(b)
+        g.add(prow)
+
+        sw = Adw.SwitchRow(title="Start Noctalia with niri",
+                           subtitle=esc("spawn-at-startup " + " ".join(f'"{c}"' for c in self.n_start_cmd())))
+        sw.set_active(bool(self.n_startup_nodes()))
+
+        def start_cb(r, _):
+            if r.get_active():
+                if not self.n_startup_nodes():
+                    st.add_top_node("spawn-at-startup", args=self.n_start_cmd(), page="noctalia",
+                                    desc="start Noctalia with niri")
+            else:
+                while True:
+                    items = [(d, n) for d, n in self.n_startup_nodes() if st.can_modify(d)]
+                    if not items:
+                        break
+                    st.delete_node(items[0][0], items[0][1], "noctalia", "start Noctalia with niri")
+                    self._note_foreign(items[0][0], once=True)
+                self._blocked_toast([d.path.name for d, n in self.n_startup_nodes()])
+            r.add_css_class("changed")
+            self.rebuild_page("noctalia")
+        sw.connect("notify::active", start_cb)
+        g.add(sw)
+
+        if v5:
+            self.noctalia_v5_groups(pg)
+
+        # -- keybinds (both versions)
+        kg = self.group(pg, "Noctalia keybinds", "Binds for the launcher, control center, volume and brightness. "
+                        "A key that already has another action is replaced.")
+        allb = Gtk.Button(label="Enable all", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+        kg.set_header_suffix(allb)
+        todo = []
+        for key, label, act in self.n_binds():
+            loc = self._bind_loc(key)
+            cur = self._bind_text(loc) if loc else None
+            row = Adw.SwitchRow(title=esc(f"{label}   ({key})"),
+                                subtitle=esc(act + (f"     replaces: {cur}" if cur and cur != act else "")))
+            row.set_active(cur == act)
+            if cur != act:
+                todo.append((key, act))
+
+            def bcb(r, _, key=key, act=act):
+                if r.get_active():
+                    self.set_bind(key, act)
+                else:
+                    self.remove_bind(key, act)
+                r.add_css_class("changed")
+                self.rebuild_page("noctalia")
+            row.connect("notify::active", bcb)
+            kg.add(row)
+
+        def enable_all(*_):
+            for key, act in todo:
+                self.set_bind(key, act)
+            self.rebuild_page("noctalia")
+        allb.connect("clicked", enable_all)
+        allb.set_sensitive(bool(todo))
+        return pg
+
+    def n_startup_nodes(self):
+        out = []
+        for d, n in self.store.top_nodes("spawn-at-startup", "spawn-sh-at-startup"):
+            a = [str(x.value) for x in n.args]
+            if a and (a[0] in ("noctalia", "noctalia-shell") or a[:3] == ["qs", "-c", "noctalia-shell"]
+                      or (n.name == "spawn-sh-at-startup" and "noctalia" in a[0])):
+                out.append((d, n))
+        return out
+
+    def _round_pred(self, n):
+        return self._bare(n) and bool(n.kids("geometry-corner-radius"))
+
+    def corner_rule(self):
+        items = self._rules("window-rule", self._round_pred)
+        return items[0] if items else None
+
+    def set_corner_radius(self, value):
+        """Change the radius in the file that holds the rule (ours, or one of yours)."""
+        loc = self.corner_rule()
+        if not loc or not self.store.can_modify(loc[0]):
+            return False
+        kid = loc[1].kids("geometry-corner-radius")[0]
+        self.store.replace_args(loc[0], kid, [int(round(value))], "noctalia", "corner radius")
+        self._note_foreign(loc[0], once=True)
+        return True
+
+    def noctalia_v5_groups(self, pg):
+        st = self.store
+        # -- window appearance
+        g = self.group(pg, "Window appearance")
+        g.add(self._rule_switch("Rounded corners", "window-rule { geometry-corner-radius; clip-to-geometry }",
+                                [("window-rule", self._round_pred, "geometry-corner-radius 20\nclip-to-geometry true")]))
+        loc = self.corner_rule()
+        radius = float(loc[1].kids("geometry-corner-radius")[0].arg0 or 20) if loc else 20.0
+        rrow = Adw.SpinRow.new(Gtk.Adjustment(value=radius, lower=0, upper=64, step_increment=1, page_increment=4), 0, 0)
+        rrow.set_title("Corner radius")
+        if loc and st.managed_mode and loc[0] is not st.managed:
+            rrow.set_subtitle(esc(f"Defined in {loc[0].path.name}; changes are made there"))
+        elif not loc:
+            rrow.set_subtitle("Turn on rounded corners first")
+        rrow.set_sensitive(bool(loc) and st.can_modify(loc[0]))
+        rrow.connect("notify::value", lambda r, _: self.set_corner_radius(r.get_value()))
+        g.add(rrow)
+        floating = lambda n: any(m.prop("app-id") == "dev.noctalia.Noctalia" for m in n.kids("match"))  # noqa: E731
+        g.add(self._rule_switch("Float the Noctalia settings window", "Opens it as a floating 1080x920 window",
+                                [("window-rule", floating, 'match app-id="dev.noctalia.Noctalia"\nopen-floating true\n'
+                                  'default-column-width { fixed 1080; }\ndefault-window-height { fixed 920; }')]))
+        g.add(self.r_switch("noctalia", "Allow notification actions", "debug { honor-xdg-activation-with-invalid-serial }",
+                            ["debug", "honor-xdg-activation-with-invalid-serial"]))
+
+        # -- wallpaper / overview
+        wg = self.group(pg, "Wallpaper & overview",
+                        "'Blurred' needs Noctalia's backdrop turned ON in Noctalia's settings; 'Stationary' and "
+                        "'Flat color' need it OFF.")
+        wrow = Adw.ComboRow(title="Overview style")
+        wrow.set_model(Gtk.StringList.new(["Not configured", "Blurred overview wallpaper", "Stationary wallpaper",
+                                           "Flat colored overview"]))
+        wrow.set_selected(self.wp_mode())
+
+        def wp_cb(r, _):
+            self.set_wp_mode(r.get_selected())
+            r.add_css_class("changed")
+            self.rebuild_page("noctalia")
+        wrow.connect("notify::selected", wp_cb)
+        wg.add(wrow)
+        if self.wp_mode() == 3:
+            wg.add(self.r_color("noctalia", "Overview color", ["overview", "backdrop-color"], "#26233a"))
+
+        # -- blur
+        ver = self.niri_version()
+        old = ver is not None and ver < (26, 4)
+        bg = self.group(pg, "Blur", "Needs niri 26.04 or newer." + (f" You have {ver[0]}.{ver[1]:02d}." if ver else ""))
+        blur_specs = [
+            ("window-rule", lambda n: self._bare(n) and bool(n.kids("background-effect")),
+             "background-effect {\n    blur true\n    xray false\n}"),
+            ("layer-rule", lambda n: self._match_ns(n, lambda s: s.startswith("^noctalia-(bar-")),
+             f'match namespace="{self.BLUR_NS}"\nbackground-effect {{\n    xray false\n}}'),
+            ("layer-rule", lambda n: self._match_ns(n, lambda s: s == "noctalia-window-switcher"),
+             'match namespace="noctalia-window-switcher"\nbackground-effect {\n    blur true\n    xray false\n}'),
+        ]
+        brow = self._rule_switch("Blur windows and Noctalia surfaces", "No xray, so blur samples what is behind",
+                                 blur_specs)
+        brow.set_sensitive(not old)
+        bg.add(brow)
+        for title, key, lo, hi, step, dig, dflt in (("Passes", "passes", 1, 8, 1, 0, 3),
+                                                    ("Offset", "offset", 0.5, 12, 0.5, 1, 3.0),
+                                                    ("Noise", "noise", 0, 0.2, 0.01, 2, 0.02),
+                                                    ("Saturation", "saturation", 0, 3, 0.1, 1, 1.5)):
+            r = self.r_spin("noctalia", title, "", ["blur", key], lo, hi, step, dig, dflt)
+            r.set_sensitive(not old)
+            bg.add(r)
+
+        # -- laptop
+        lg = self.group(pg, "Laptop")
+        lid = ["switch-events", "lid-close", "spawn"]
+        ours = st.find(lid) is not None and st.get(lid) == "noctalia"
+        lrow = Adw.SwitchRow(title="Lock and suspend on lid close",
+                             subtitle='switch-events { lid-close { spawn "noctalia" "msg" "session" "lock-and-suspend" } }')
+        lrow.set_active(ours)
+
+        def lid_cb(r, _):
+            if r.get_active():
+                if st.find(["switch-events", "lid-close"]) is None:
+                    st.create(lid, args=["noctalia", "msg", "session", "lock-and-suspend"], page="noctalia",
+                              desc="lock and suspend on lid close")
+                elif not ours:
+                    self.toast("lid-close already has another action in your config")
+            elif ours:
+                st.delete_path(["switch-events", "lid-close"], "noctalia", "lock and suspend on lid close")
+                if st.find(["switch-events", "lid-close"]) is not None:
+                    self._blocked_toast([st.shadow_file(["switch-events", "lid-close"]) or "another file"])
+            r.add_css_class("changed")
+            self.rebuild_page("noctalia")
+        lrow.connect("notify::active", lid_cb)
+        lg.add(lrow)
+        lg.add(Adw.ActionRow(title="If the lid still suspends on its own",
+                             subtitle="Set HandleLidSwitch=ignore and HandleLidSwitchExternalPower=ignore in "
+                                      "/etc/systemd/logind.conf (needs root, so this app does not do it).",
+                             css_classes=["dim-label"]))
 
     # ---- page: import & backup ---------------------------------------------------------------------------
     def pg_import(self):
